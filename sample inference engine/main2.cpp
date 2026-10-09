@@ -10,7 +10,6 @@
 #include <omp.h>
 #include <stdexcept>
 #include <limits>
-#include <unordered_map>
 
 // ==========================================
 // 1. CONFIG STRUCT (llama2.c format)
@@ -55,7 +54,31 @@ struct QuantizedTensorINT8 {
 
     QuantizedTensorINT8() = default;
 
-    // Direct quantization matching standard llama2.c / PyTorch row-major layout
+    // llama2.c stores matrices row-major as [out_dim, in_dim].
+    // Quantize in that same layout; do NOT transpose the checkpoint weights.
+    void transpose_and_quantize(const float* raw_data, int out_dim, int in_dim) {
+        shape = {out_dim, in_dim};
+        size_t total_size = static_cast<size_t>(out_dim) * in_dim;
+        data.resize(total_size);
+
+        float max_val = 0.0f;
+        for (size_t i = 0; i < total_size; ++i) {
+            max_val = std::max(max_val, std::abs(raw_data[i]));
+        }
+
+        scale = (max_val > 0.0f) ? (max_val / 127.0f) : 1.0f;
+        float inv_scale = 1.0f / scale;
+
+        for (int row = 0; row < out_dim; ++row) {
+            for (int col = 0; col < in_dim; ++col) {
+                float val = raw_data[static_cast<size_t>(row) * in_dim + col];
+                float scaled = std::round(val * inv_scale);
+                int clamped = std::clamp(static_cast<int>(scaled), -128, 127);
+                data[row * in_dim + col] = static_cast<int8_t>(clamped);
+            }
+        }
+    }
+
     void quantize_direct(const float* fp32_data, int rows, int cols) {
         shape = {rows, cols};
         size_t total_size = static_cast<size_t>(rows) * cols;
@@ -326,13 +349,12 @@ public:
 };
 
 // ==========================================
-// 7. TOKENIZER
+// 7. BINARY TOKENIZER PARSER
 // ==========================================
 class Tokenizer {
 public:
     std::vector<std::string> vocab;
     std::vector<float> vocab_scores;
-    std::unordered_map<std::string, int> token_to_id;
 
     bool load(const std::string& path, int vocab_size) {
         std::ifstream file(path, std::ios::binary);
@@ -342,34 +364,25 @@ public:
         if (!file.read(reinterpret_cast<char*>(&max_token_len), sizeof(max_token_len)) ||
             vocab_size <= 0) return false;
 
-        vocab.clear(); vocab_scores.clear(); token_to_id.clear();
+        vocab.clear(); vocab_scores.clear();
         vocab.reserve(vocab_size); vocab_scores.reserve(vocab_size);
-
         for (int i = 0; i < vocab_size; ++i) {
             float score = 0.0f;
             int32_t len = 0;
             if (!file.read(reinterpret_cast<char*>(&score), sizeof(score)) ||
                 !file.read(reinterpret_cast<char*>(&len), sizeof(len))) return false;
+            if (len < 0 || static_cast<uint32_t>(len) > max_token_len) return false;
             std::string token(static_cast<size_t>(len), '\0');
             if (len > 0 && !file.read(token.data(), len)) return false;
-
             vocab_scores.push_back(score);
-            token_to_id[token] = i;
             vocab.push_back(std::move(token));
         }
         return true;
     }
 
-    int find_token(const std::string& word) const {
-        auto it = token_to_id.find(word);
-        if (it != token_to_id.end()) return it->second;
-        return -1;
-    }
-
     std::string decode(int token_id) const {
         if (token_id < 0 || token_id >= static_cast<int>(vocab.size())) return "";
         std::string s = vocab[token_id];
-        // Handle SentencePiece whitespace prefix (\xE2\x96\x81)
         if (s.rfind("\xE2\x96\x81", 0) == 0) {
             s = " " + s.substr(3);
         }
@@ -394,11 +407,8 @@ public:
     Stories15MEngine() : final_norm(1) {}
 
     bool load_model(const std::string& model_path) {
-        std::ifstream file(model_path, std::ios::binary | std::ios::ate);
+        std::ifstream file(model_path, std::ios::binary);
         if (!file.is_open()) return false;
-
-        std::streamsize file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
 
         if (!file.read(reinterpret_cast<char*>(&config), sizeof(Config))) return false;
         
@@ -410,6 +420,12 @@ public:
             return file.good();
         };
 
+        std::cout << "Loading Model Architecture: Dim=" << config.dim 
+                  << " Layers=" << config.n_layers 
+                  << " Heads=" << config.n_heads 
+                  << " Vocab=" << actual_vocab_size 
+                  << " SharedWeights=" << (shared_weights ? "Yes" : "No") << "\n";
+
         final_norm = RMSNorm(config.dim);
         tok_embeddings = Tensor({actual_vocab_size, config.dim});
         if (!read_exact(reinterpret_cast<char*>(tok_embeddings.data.data()), tok_embeddings.size() * sizeof(float))) return false;
@@ -417,7 +433,7 @@ public:
         auto read_fp32_vec = [&](size_t size) {
             std::vector<float> buf(size);
             if (!read_exact(reinterpret_cast<char*>(buf.data()), size * sizeof(float)))
-                throw std::runtime_error("Truncated checkpoint file read");
+                throw std::runtime_error("Truncated file read");
             return buf;
         };
 
@@ -428,18 +444,17 @@ public:
 
             if (!read_exact(reinterpret_cast<char*>(layer.attn_norm.weight.data()), config.dim * sizeof(float))) return false;
 
-            // Direct quantization for standard llama2.c linear weight order
             auto q_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim);
-            layer.attention.W_q.quantize_direct(q_w.data(), config.dim, config.dim);
+            layer.attention.W_q.transpose_and_quantize(q_w.data(), config.dim, config.dim);
 
             auto k_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim);
-            layer.attention.W_k.quantize_direct(k_w.data(), config.dim, config.dim);
+            layer.attention.W_k.transpose_and_quantize(k_w.data(), config.dim, config.dim);
 
             auto v_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim);
-            layer.attention.W_v.quantize_direct(v_w.data(), config.dim, config.dim);
+            layer.attention.W_v.transpose_and_quantize(v_w.data(), config.dim, config.dim);
 
             auto o_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim);
-            layer.attention.W_o.quantize_direct(o_w.data(), config.dim, config.dim);
+            layer.attention.W_o.transpose_and_quantize(o_w.data(), config.dim, config.dim);
 
             if (!read_exact(reinterpret_cast<char*>(layer.ffn_norm.weight.data()), config.dim * sizeof(float))) return false;
 
@@ -447,20 +462,19 @@ public:
             auto down_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.hidden_dim);
             auto up_w   = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim);
 
-            layer.ffn.W_gate.quantize_direct(gate_w.data(), config.hidden_dim, config.dim);
-            layer.ffn.W_down.quantize_direct(down_w.data(), config.dim, config.hidden_dim);
-            layer.ffn.W_up.quantize_direct(up_w.data(), config.hidden_dim, config.dim);
+            layer.ffn.W_gate.transpose_and_quantize(gate_w.data(), config.hidden_dim, config.dim);
+            layer.ffn.W_down.transpose_and_quantize(down_w.data(), config.dim, config.hidden_dim);
+            layer.ffn.W_up.transpose_and_quantize(up_w.data(), config.hidden_dim, config.dim);
         }
 
         if (!read_exact(reinterpret_cast<char*>(final_norm.weight.data()), config.dim * sizeof(float))) return false;
 
-        // Skip RoPE precomputed table
-        size_t rope_bytes = config.seq_len * (config.dim / config.n_heads) * sizeof(float);
-        file.seekg(rope_bytes, std::ios::cur);
-
+        // The standard llama2.c checkpoint does not store RoPE tables.
+        // Therefore, do not seek past bytes here: an untied output head follows
+        // final_norm immediately in that format.
         if (!shared_weights) {
             auto lm_head_w = read_fp32_vec(static_cast<size_t>(actual_vocab_size) * config.dim);
-            lm_head.quantize_direct(lm_head_w.data(), actual_vocab_size, config.dim);
+            lm_head.transpose_and_quantize(lm_head_w.data(), actual_vocab_size, config.dim);
         } else {
             lm_head.quantize_direct(tok_embeddings.data.data(), actual_vocab_size, config.dim);
         }
@@ -513,33 +527,13 @@ int main() {
             return 1;
         }
 
-        // Properly escape UTF-8 whitespace prefix \xE2\x96\x81
-        const std::string sp = "\xE2\x96\x81";
-        
-        int id_once = tokenizer.find_token(sp + "Once");
-        if (id_once < 0) id_once = tokenizer.find_token("Once");
-
-        int id_upon = tokenizer.find_token(sp + "upon");
-        if (id_upon < 0) id_upon = tokenizer.find_token("upon");
-
-        int id_a = tokenizer.find_token(sp + "a");
-        if (id_a < 0) id_a = tokenizer.find_token("a");
-
-        int id_time = tokenizer.find_token(sp + "time");
-        if (id_time < 0) id_time = tokenizer.find_token("time");
-
-        std::vector<int> prompt = {1}; // BOS
-        if (id_once >= 0) prompt.push_back(id_once);
-        if (id_upon >= 0) prompt.push_back(id_upon);
-        if (id_a >= 0) prompt.push_back(id_a);
-        if (id_time >= 0) prompt.push_back(id_time);
-
+        // Canonical LLaMA-2 tokenizer IDs for: "<s> Once upon a time"
+        // This assumes tokenizer.bin uses the standard LLaMA-2 32k vocabulary.
+        std::vector<int> prompt = {1, 9038, 526, 263, 931}; 
         int max_tokens = 40;
         int pos = 0;
         int generated_tokens = 0;
 
-        std::cout << "\nPrompt Token IDs: ";
-        for (int t : prompt) std::cout << t << " ";
         std::cout << "\nPrompt: ";
         for (int t : prompt) std::cout << tokenizer.decode(t);
         std::cout << "\nGenerated: " << std::flush;
@@ -556,7 +550,7 @@ int main() {
             ++generated_tokens;
         }
 
-        // Autoregressive Generation Loop
+        // Autoregressive Decoding Loop
         while (generated_tokens < max_tokens && pos < model.config.seq_len) {
             if (next_token == 1 || next_token == 2) break;
             logits = model.forward({next_token}, pos);
@@ -577,7 +571,7 @@ int main() {
 
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << "\n";
+        std::cerr << "Fatal inference error: " << e.what() << "\n";
         return 1;
     }
 }
