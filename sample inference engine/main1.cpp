@@ -54,8 +54,7 @@ struct QuantizedTensorINT8 {
 
     QuantizedTensorINT8() = default;
 
-    // llama2.c stores matrices row-major as [out_dim, in_dim].
-    // Quantize in that same layout; do NOT transpose the checkpoint weights.
+    // Transpose weight layout from raw binary format [in_dim, out_dim] -> [out_dim, in_dim]
     void transpose_and_quantize(const float* raw_data, int out_dim, int in_dim) {
         shape = {out_dim, in_dim};
         size_t total_size = static_cast<size_t>(out_dim) * in_dim;
@@ -71,7 +70,7 @@ struct QuantizedTensorINT8 {
 
         for (int row = 0; row < out_dim; ++row) {
             for (int col = 0; col < in_dim; ++col) {
-                float val = raw_data[static_cast<size_t>(row) * in_dim + col];
+                float val = raw_data[col * out_dim + row];
                 float scaled = std::round(val * inv_scale);
                 int clamped = std::clamp(static_cast<int>(scaled), -128, 127);
                 data[row * in_dim + col] = static_cast<int8_t>(clamped);
@@ -371,7 +370,6 @@ public:
             int32_t len = 0;
             if (!file.read(reinterpret_cast<char*>(&score), sizeof(score)) ||
                 !file.read(reinterpret_cast<char*>(&len), sizeof(len))) return false;
-            if (len < 0 || static_cast<uint32_t>(len) > max_token_len) return false;
             std::string token(static_cast<size_t>(len), '\0');
             if (len > 0 && !file.read(token.data(), len)) return false;
             vocab_scores.push_back(score);
@@ -469,9 +467,10 @@ public:
 
         if (!read_exact(reinterpret_cast<char*>(final_norm.weight.data()), config.dim * sizeof(float))) return false;
 
-        // The standard llama2.c checkpoint does not store RoPE tables.
-        // Therefore, do not seek past bytes here: an untied output head follows
-        // final_norm immediately in that format.
+        const std::streamoff rope_bytes = static_cast<std::streamoff>(config.seq_len) *
+            (config.dim / config.n_heads) * static_cast<std::streamoff>(sizeof(float));
+        file.seekg(rope_bytes, std::ios::cur);
+
         if (!shared_weights) {
             auto lm_head_w = read_fp32_vec(static_cast<size_t>(actual_vocab_size) * config.dim);
             lm_head.transpose_and_quantize(lm_head_w.data(), actual_vocab_size, config.dim);
@@ -527,9 +526,8 @@ int main() {
             return 1;
         }
 
-        // Canonical LLaMA-2 tokenizer IDs for: "<s> Once upon a time"
-        // This assumes tokenizer.bin uses the standard LLaMA-2 32k vocabulary.
-        std::vector<int> prompt = {1, 9038, 526, 263, 931}; 
+        // Canonical token IDs for: "<s> Once upon a time"
+        std::vector<int> prompt = {1, 15043, 278, 263, 931}; 
         int max_tokens = 40;
         int pos = 0;
         int generated_tokens = 0;
