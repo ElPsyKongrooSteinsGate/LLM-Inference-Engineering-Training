@@ -1,0 +1,599 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <algorithm>
+#include <fstream>
+#include <chrono>
+#include <cstring>
+#include <immintrin.h>
+#include <omp.h>
+#include <stdexcept>
+#include <limits>
+
+// ==========================================
+// 1. CONFIG & HEADER STRUCT (llama2.c format)
+// ==========================================
+struct Config {
+    int dim;        // 288
+    int hidden_dim; // 768
+    int n_layers;   // 6
+    int n_heads;    // 6
+    int n_kv_heads; // 6
+    int vocab_size; // 32000 (positive = shared weights, negative = separate head)
+    int seq_len;    // 256
+};
+
+// ==========================================
+// 2. FP32 TENSOR
+// ==========================================
+class Tensor {
+public:
+    std::vector<int> shape;
+    std::vector<float> data;
+
+    Tensor() = default;
+    Tensor(std::vector<int> shape) : shape(shape) {
+        size_t total_size = 1;
+        for (int dim : shape) total_size *= dim;
+        data.resize(total_size, 0.0f);
+    }
+
+    size_t size() const { return data.size(); }
+    inline float& operator()(int r, int c) { return data[r * shape[1] + c]; }
+    inline const float& operator()(int r, int c) const { return data[r * shape[1] + c]; }
+};
+
+// ==========================================
+// 3. INT8 QUANTIZED TENSOR & AVX2 MATMUL
+// ==========================================
+struct QuantizedTensorINT8 {
+    std::vector<int8_t> data;
+    std::vector<int> shape; // [out_dim x in_dim]
+    float scale;
+
+    QuantizedTensorINT8() = default;
+
+    void quantize_from_ptr(const float* fp32_data, int rows, int cols) {
+        if (rows <= 0 || cols <= 0 || fp32_data == nullptr)
+            throw std::runtime_error("Invalid dimensions or null weights during quantization");
+        shape = {rows, cols};
+        size_t total_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        data.resize(total_size);
+
+        float max_val = 0.0f;
+        for (size_t i = 0; i < total_size; ++i) {
+            max_val = std::max(max_val, std::abs(fp32_data[i]));
+        }
+
+        scale = (max_val > 0.0f) ? (max_val / 127.0f) : 1.0f;
+        float inv_scale = 1.0f / scale;
+
+        for (size_t i = 0; i < total_size; ++i) {
+            float scaled = std::round(fp32_data[i] * inv_scale);
+            int clamped = std::clamp(static_cast<int>(scaled), -128, 127);
+            data[i] = static_cast<int8_t>(clamped);
+        }
+    }
+
+    static inline float _mm256_reduce_add_ps(__m256 v) {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        return _mm_cvtss_f32(lo);
+    }
+
+    // One OpenMP region across all output elements; avoid thread-launch overhead
+    // for small single-token projections. Requires AVX2 + FMA (e.g. -march=native).
+    static Tensor matmul(const Tensor& A, const QuantizedTensorINT8& B) {
+        if (A.shape.size() != 2 || B.shape.size() != 2 ||
+            A.shape[1] != B.shape[1] || B.data.empty() || A.data.empty())
+            throw std::runtime_error("Matmul shape mismatch or empty tensor");
+
+        const int M = A.shape[0];
+        const int K = A.shape[1];
+        const int N = B.shape[0];
+        if (B.data.size() != static_cast<size_t>(N) * K)
+            throw std::runtime_error("Invalid quantized weight storage size");
+
+        Tensor C({M, N});
+        const float scale = B.scale;
+        #pragma omp parallel for collapse(2) schedule(static) if(static_cast<long long>(M) * N >= 4096)
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                __m256 accum_vec = _mm256_setzero_ps();
+                int k = 0;
+                const int8_t* b_row = B.data.data() + static_cast<size_t>(j) * K;
+                const float* a_row = A.data.data() + static_cast<size_t>(i) * K;
+                for (; k <= K - 8; k += 8) {
+                    const __m256 a_vec = _mm256_loadu_ps(a_row + k);
+                    int64_t b_raw;
+                    std::memcpy(&b_raw, b_row + k, sizeof(b_raw));
+                    const __m128i b_int8 = _mm_cvtsi64_si128(b_raw);
+                    const __m256i b_int32 = _mm256_cvtepi8_epi32(b_int8);
+                    const __m256 b_fp32 = _mm256_cvtepi32_ps(b_int32);
+                    accum_vec = _mm256_fmadd_ps(a_vec, b_fp32, accum_vec);
+                }
+                float dot = _mm256_reduce_add_ps(accum_vec);
+                for (; k < K; ++k) dot += a_row[k] * static_cast<float>(b_row[k]);
+                C.data[static_cast<size_t>(i) * N + j] = dot * scale;
+            }
+        }
+        return C;
+    }
+};
+
+inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
+
+void softmax(float* row, int size) {
+    float max_val = row[0];
+    for (int i = 1; i < size; ++i) if (row[i] > max_val) max_val = row[i];
+    float sum = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        row[i] = std::exp(row[i] - max_val);
+        sum += row[i];
+    }
+    for (int i = 0; i < size; ++i) row[i] /= sum;
+}
+
+// ==========================================
+// 4. KV CACHE (WITH BOUNDS CHECKING)
+// ==========================================
+struct KVCache {
+    int max_seq_len;
+    int d_model;
+    int current_pos = 0;
+    Tensor k_cache, v_cache;
+
+    KVCache() = default;
+    KVCache(int max_seq_len, int d_model)
+        : max_seq_len(max_seq_len), d_model(d_model),
+          k_cache({max_seq_len, d_model}), v_cache({max_seq_len, d_model}) {}
+
+    // Problem 4 Fix: Safe append with explicit sequence length check
+    bool append(const Tensor& new_k, const Tensor& new_v) {
+        int num_tokens = new_k.shape[0];
+        if (current_pos + num_tokens > max_seq_len) {
+            std::cerr << "Error: KV cache position (" << (current_pos + num_tokens) 
+                      << ") exceeds max sequence length (" << max_seq_len << ").\n";
+            return false;
+        }
+        for (int i = 0; i < num_tokens; ++i) {
+            for (int d = 0; d < d_model; ++d) {
+                k_cache(current_pos + i, d) = new_k(i, d);
+                v_cache(current_pos + i, d) = new_v(i, d);
+            }
+        }
+        current_pos += num_tokens;
+        return true;
+    }
+};
+
+// ==========================================
+// 5. RMSNORM & ROTARY POSITIONAL EMBEDDING
+// ==========================================
+class RMSNorm {
+public:
+    int dim;
+    float eps;
+    std::vector<float> weight;
+
+    RMSNorm(int dim, float eps = 1e-5f) : dim(dim), eps(eps), weight(dim, 1.0f) {}
+
+    Tensor forward(const Tensor& X) const {
+        int seq_len = X.shape[0];
+        Tensor Y({seq_len, dim});
+        for (int i = 0; i < seq_len; ++i) {
+            float sum_sq = 0.0f;
+            for (int d = 0; d < dim; ++d) sum_sq += X(i, d) * X(i, d);
+            float inv_rms = 1.0f / std::sqrt((sum_sq / dim) + eps);
+            for (int d = 0; d < dim; ++d) Y(i, d) = X(i, d) * inv_rms * weight[d];
+        }
+        return Y;
+    }
+};
+
+void apply_rope(Tensor& vec, int pos, int head_dim) {
+    int num_heads = vec.shape[1] / head_dim;
+    for (int h = 0; h < num_heads; ++h) {
+        for (int i = 0; i < head_dim / 2; ++i) {
+            float freq = 1.0f / std::pow(10000.0f, static_cast<float>(i * 2) / head_dim);
+            float val = pos * freq;
+            float fcr = std::cos(val);
+            float fci = std::sin(val);
+
+            int idx0 = h * head_dim + i;
+            int idx1 = h * head_dim + i + head_dim / 2;
+
+            float v0 = vec(0, idx0);
+            float v1 = vec(0, idx1);
+
+            vec(0, idx0) = v0 * fcr - v1 * fci;
+            vec(0, idx1) = v0 * fci + v1 * fcr;
+        }
+    }
+}
+
+// ==========================================
+// 6. TRANSFORMER BLOCK & LAYERS
+// ==========================================
+class QuantizedMultiHeadAttention {
+public:
+    int d_model, num_heads, head_dim;
+    QuantizedTensorINT8 W_q, W_k, W_v, W_o;
+
+    QuantizedMultiHeadAttention(int d_model, int num_heads)
+        : d_model(d_model), num_heads(num_heads), head_dim(d_model / num_heads) {}
+
+    Tensor forward(const Tensor& X, KVCache& cache, int start_pos) {
+        int seq_len = X.shape[0];
+
+        Tensor Q = QuantizedTensorINT8::matmul(X, W_q);
+        Tensor new_K = QuantizedTensorINT8::matmul(X, W_k);
+        Tensor new_V = QuantizedTensorINT8::matmul(X, W_v);
+
+        for (int i = 0; i < seq_len; ++i) {
+            Tensor q_token({1, d_model}), k_token({1, d_model});
+            for (int d = 0; d < d_model; ++d) {
+                q_token(0, d) = Q(i, d);
+                k_token(0, d) = new_K(i, d);
+            }
+
+            apply_rope(q_token, start_pos + i, head_dim);
+            apply_rope(k_token, start_pos + i, head_dim);
+
+            for (int d = 0; d < d_model; ++d) {
+                Q(i, d) = q_token(0, d);
+                new_K(i, d) = k_token(0, d);
+            }
+        }
+
+        if (!cache.append(new_K, new_V)) {
+            throw std::runtime_error("KV cache capacity exceeded; reduce prompt/output length");
+        }
+
+        int total_cached_len = cache.current_pos;
+        Tensor output({seq_len, d_model});
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        for (int h = 0; h < num_heads; ++h) {
+            int head_offset = h * head_dim;
+            Tensor scores({seq_len, total_cached_len});
+
+            for (int i = 0; i < seq_len; ++i) {
+                int absolute_q_pos = (total_cached_len - seq_len) + i;
+                for (int j = 0; j < total_cached_len; ++j) {
+                    if (j > absolute_q_pos) { scores(i, j) = -1e9f; continue; }
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += Q(i, head_offset + d) * cache.k_cache(j, head_offset + d);
+                    scores(i, j) = dot * scale;
+                }
+                softmax(&scores.data[i * total_cached_len], total_cached_len);
+            }
+
+            for (int i = 0; i < seq_len; ++i) {
+                for (int d = 0; d < head_dim; ++d) {
+                    float val = 0.0f;
+                    for (int j = 0; j < total_cached_len; ++j)
+                        val += scores(i, j) * cache.v_cache(j, head_offset + d);
+                    output(i, head_offset + d) = val;
+                }
+            }
+        }
+        return QuantizedTensorINT8::matmul(output, W_o);
+    }
+};
+
+class QuantizedSwiGLUFFN {
+public:
+    int d_model, hidden_dim;
+    QuantizedTensorINT8 W_gate, W_up, W_down;
+
+    QuantizedSwiGLUFFN(int d_model, int hidden_dim) : d_model(d_model), hidden_dim(hidden_dim) {}
+
+    Tensor forward(const Tensor& X) const {
+        int seq_len = X.shape[0];
+        Tensor gate = QuantizedTensorINT8::matmul(X, W_gate);
+        Tensor up   = QuantizedTensorINT8::matmul(X, W_up);
+
+        Tensor intermediate({seq_len, hidden_dim});
+        for (int i = 0; i < seq_len; ++i)
+            for (int d = 0; d < hidden_dim; ++d)
+                intermediate(i, d) = silu(gate(i, d)) * up(i, d);
+
+        return QuantizedTensorINT8::matmul(intermediate, W_down);
+    }
+};
+
+class QuantizedTransformerBlock {
+public:
+    RMSNorm attn_norm;
+    QuantizedMultiHeadAttention attention;
+    RMSNorm ffn_norm;
+    QuantizedSwiGLUFFN ffn;
+
+    QuantizedTransformerBlock(int d_model, int num_heads, int hidden_dim)
+        : attn_norm(d_model), attention(d_model, num_heads),
+          ffn_norm(d_model), ffn(d_model, hidden_dim) {}
+
+    Tensor forward(const Tensor& X, KVCache& cache, int start_pos) {
+        int seq_len = X.shape[0], d_model = X.shape[1];
+        Tensor norm_x1 = attn_norm.forward(X);
+        Tensor attn_out = attention.forward(norm_x1, cache, start_pos);
+
+        Tensor x_res1({seq_len, d_model});
+        for (size_t i = 0; i < X.size(); ++i) x_res1.data[i] = X.data[i] + attn_out.data[i];
+
+        Tensor norm_x2 = ffn_norm.forward(x_res1);
+        Tensor ffn_out = ffn.forward(norm_x2);
+
+        Tensor x_out({seq_len, d_model});
+        for (size_t i = 0; i < x_res1.size(); ++i) x_out.data[i] = x_res1.data[i] + ffn_out.data[i];
+
+        return x_out;
+    }
+};
+
+// ==========================================
+// 7. BINARY TOKENIZER PARSER
+// ==========================================
+class Tokenizer {
+public:
+    std::vector<std::string> vocab;
+    std::vector<float> vocab_scores;
+
+    bool load(const std::string& path, int vocab_size) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        uint32_t max_token_len = 0;
+        if (!file.read(reinterpret_cast<char*>(&max_token_len), sizeof(max_token_len)) ||
+            vocab_size <= 0 || max_token_len == 0 || max_token_len > (1u << 20)) return false;
+
+        vocab.clear(); vocab_scores.clear();
+        vocab.reserve(vocab_size); vocab_scores.reserve(vocab_size);
+        for (int i = 0; i < vocab_size; ++i) {
+            float score = 0.0f;
+            int32_t len = 0;
+            if (!file.read(reinterpret_cast<char*>(&score), sizeof(score)) ||
+                !file.read(reinterpret_cast<char*>(&len), sizeof(len)) ||
+                len < 0 || static_cast<uint32_t>(len) > max_token_len) return false;
+            std::string token(static_cast<size_t>(len), '\0');
+            if (len > 0 && !file.read(token.data(), len)) return false;
+            vocab_scores.push_back(score);
+            vocab.push_back(std::move(token));
+        }
+        return true;
+    }
+
+    std::string decode(int token_id) const {
+        if (token_id < 0 || token_id >= static_cast<int>(vocab.size())) return "<unk>";
+        return vocab[token_id];
+    }
+};
+
+// ==========================================
+// 8. ENGINE LOADER & INFERENCE ENGINE
+// ==========================================
+class Stories15MEngine {
+public:
+    Config config;
+    int actual_vocab_size;
+    bool shared_weights;
+    Tensor tok_embeddings;
+    std::vector<QuantizedTransformerBlock> layers;
+    RMSNorm final_norm;
+    QuantizedTensorINT8 lm_head;
+    std::vector<KVCache> caches;
+
+    Stories15MEngine() : final_norm(1) {}
+
+    bool load_model(const std::string& model_path) {
+        std::ifstream file(model_path, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open model binary: " << model_path << "\n";
+            return false;
+        }
+
+        // Validate header before allocating model-sized buffers.
+        if (!file.read(reinterpret_cast<char*>(&config), sizeof(Config))) {
+            std::cerr << "Checkpoint is too small to contain a valid header.\n";
+            return false;
+        }
+        if (config.dim <= 0 || config.hidden_dim <= 0 || config.n_layers <= 0 ||
+            config.n_heads <= 0 || config.n_kv_heads <= 0 || config.seq_len <= 0 ||
+            config.vocab_size == 0 || config.vocab_size == std::numeric_limits<int>::min() ||
+            config.dim % config.n_heads != 0 || config.n_kv_heads > config.n_heads ||
+            config.n_heads % config.n_kv_heads != 0 || config.seq_len > 1048576 ||
+            std::abs(config.vocab_size) > 1000000 || config.dim > 65536 || config.hidden_dim > 262144 || config.n_layers > 256) {
+            std::cerr << "Invalid or unsupported checkpoint configuration.\n";
+            return false;
+        }
+        actual_vocab_size = std::abs(config.vocab_size);
+        shared_weights = config.vocab_size > 0;
+
+        auto read_exact = [&](char* dst, size_t bytes, const char* what) -> bool {
+            if (bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) return false;
+            if (!file.read(dst, static_cast<std::streamsize>(bytes))) {
+                std::cerr << "Truncated checkpoint while reading " << what << ".\n";
+                return false;
+            }
+            return true;
+        };
+
+        std::cout << "Loading Model Architecture: Dim=" << config.dim 
+                  << " Layers=" << config.n_layers 
+                  << " Heads=" << config.n_heads 
+                  << " Vocab=" << actual_vocab_size 
+                  << " SharedWeights=" << (shared_weights ? "Yes" : "No") << "\n";
+
+        final_norm = RMSNorm(config.dim);
+        tok_embeddings = Tensor({actual_vocab_size, config.dim});
+        if (!read_exact(reinterpret_cast<char*>(tok_embeddings.data.data()), tok_embeddings.size() * sizeof(float), "token embeddings")) return false;
+
+        auto read_fp32_vec = [&](size_t size, const char* what) {
+            std::vector<float> buf(size);
+            if (!read_exact(reinterpret_cast<char*>(buf.data()), size * sizeof(float), what))
+                throw std::runtime_error(std::string("Failed to read ") + what);
+            return buf;
+        };
+
+        for (int l = 0; l < config.n_layers; ++l) {
+            layers.emplace_back(config.dim, config.n_heads, config.hidden_dim);
+            caches.emplace_back(config.seq_len, config.dim);
+            auto& layer = layers.back();
+
+            if (!read_exact(reinterpret_cast<char*>(layer.attn_norm.weight.data()), config.dim * sizeof(float), "attention norm")) return false;
+
+            auto q_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            layer.attention.W_q.quantize_from_ptr(q_w.data(), config.dim, config.dim);
+
+            auto k_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            layer.attention.W_k.quantize_from_ptr(k_w.data(), config.dim, config.dim);
+
+            auto v_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            layer.attention.W_v.quantize_from_ptr(v_w.data(), config.dim, config.dim);
+
+            auto o_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            layer.attention.W_o.quantize_from_ptr(o_w.data(), config.dim, config.dim);
+
+            if (!read_exact(reinterpret_cast<char*>(layer.ffn_norm.weight.data()), config.dim * sizeof(float), "FFN norm")) return false;
+
+            // Problem 1 Fix: llama2.c binary layout stores FFN as w1 (gate), w2 (down), w3 (up)
+            auto gate_w = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "FFN w1/w3");
+            auto down_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.hidden_dim, "FFN w2");
+            auto up_w   = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "FFN w1/w3");
+
+            layer.ffn.W_gate.quantize_from_ptr(gate_w.data(), config.hidden_dim, config.dim);
+            layer.ffn.W_up.quantize_from_ptr(up_w.data(), config.hidden_dim, config.dim);
+            layer.ffn.W_down.quantize_from_ptr(down_w.data(), config.dim, config.hidden_dim);
+        }
+
+        if (!read_exact(reinterpret_cast<char*>(final_norm.weight.data()), config.dim * sizeof(float), "final norm")) return false;
+
+        // llama2.c stores both real and imaginary RoPE tables, each seq_len*head_dim/2 floats.
+        const std::streamoff rope_bytes = static_cast<std::streamoff>(config.seq_len) *
+            (config.dim / config.n_heads) * static_cast<std::streamoff>(sizeof(float));
+        file.seekg(rope_bytes, std::ios::cur);
+        if (!file) { std::cerr << "Checkpoint ended before RoPE tables.\n"; return false; }
+
+        if (!shared_weights) {
+            auto lm_head_w = read_fp32_vec(static_cast<size_t>(actual_vocab_size) * config.dim, "output classifier");
+            lm_head.quantize_from_ptr(lm_head_w.data(), actual_vocab_size, config.dim);
+        } else {
+            lm_head.quantize_from_ptr(tok_embeddings.data.data(), actual_vocab_size, config.dim);
+        }
+
+        std::cout << "Model loaded and INT8 quantized successfully!\n";
+        return true;
+    }
+
+    std::vector<float> forward(const std::vector<int>& token_ids, int start_pos) {
+        if (token_ids.empty()) throw std::runtime_error("forward() received an empty token list");
+        if (start_pos < 0 || start_pos + static_cast<int>(token_ids.size()) > config.seq_len)
+            throw std::runtime_error("Input exceeds model context length");
+        int seq_len = static_cast<int>(token_ids.size());
+        Tensor X({seq_len, config.dim});
+        for (int i = 0; i < seq_len; ++i) {
+            int token_id = token_ids[i];
+            if (token_id < 0 || token_id >= actual_vocab_size) throw std::runtime_error("Token ID out of range");
+            for (int d = 0; d < config.dim; ++d) X(i, d) = tok_embeddings(token_id, d);
+        }
+
+        for (int l = 0; l < config.n_layers; ++l) {
+            X = layers[l].forward(X, caches[l], start_pos);
+        }
+
+        X = final_norm.forward(X);
+
+        Tensor last_hidden({1, config.dim});
+        for (int d = 0; d < config.dim; ++d) last_hidden(0, d) = X(seq_len - 1, d);
+
+        Tensor logits_tensor = QuantizedTensorINT8::matmul(last_hidden, lm_head);
+        return logits_tensor.data;
+    }
+};
+
+// ==========================================
+// 9. MAIN EXECUTION
+// ==========================================
+int main() {
+    try {
+    Tokenizer tokenizer;
+    Stories15MEngine model;
+
+    std::cout << "==========================================================" << std::endl;
+    std::cout << " INT8 QUANTIZED TINY STORIES ENGINE (stories15M.bin)     " << std::endl;
+    std::cout << "==========================================================" << std::endl;
+
+    if (!model.load_model("stories15M.bin")) {
+        std::cerr << "Please ensure 'stories15M.bin' is in the current directory.\n";
+        return 1;
+    }
+
+    if (!tokenizer.load("tokenizer.bin", model.actual_vocab_size)) {
+        std::cerr << "Failed to load 'tokenizer.bin'. Ensure it exists in the working directory.\n";
+        return 1;
+    }
+
+    // Default Prompt Tokens: "Once upon a time" (BOS = 1)
+    std::vector<int> prompt = {1, 318, 1799, 263, 929}; 
+    const int max_tokens = std::min(40, model.config.seq_len - static_cast<int>(prompt.size()));
+    if (prompt.empty() || static_cast<int>(prompt.size()) >= model.config.seq_len) {
+        std::cerr << "Prompt is empty or already reaches the model context limit.\n";
+        return 1;
+    }
+    for (int id : prompt) {
+        if (id < 0 || id >= model.actual_vocab_size) {
+            std::cerr << "Prompt contains a token ID outside the model vocabulary.\n";
+            return 1;
+        }
+    }
+    int pos = 0;
+    int generated_tokens = 0;
+
+    std::cout << "\nPrompt: ";
+    for (int t : prompt) std::cout << tokenizer.decode(t);
+    std::cout << "\nGenerated: " << std::flush;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Prefill Phase
+    std::vector<float> logits = model.forward(prompt, pos);
+    pos += prompt.size();
+
+    // Problem 5 Fix: Proper EOS termination handling
+    int next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+    if (next_token != 1 && next_token != 2) {
+        std::cout << tokenizer.decode(next_token) << std::flush;
+        ++generated_tokens;
+    }
+
+    // Autoregressive Generation Loop
+    while (generated_tokens < max_tokens && pos < model.config.seq_len) {
+        if (next_token == 1 || next_token == 2) break;
+        logits = model.forward({next_token}, pos);
+        ++pos;
+        next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        if (next_token == 1 || next_token == 2) break; // BOS/EOS
+        std::cout << tokenizer.decode(next_token) << std::flush;
+        ++generated_tokens;
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double duration = std::chrono::duration<double>(end_time - start_time).count();
+
+    std::cout << "\n\n==========================================================" << std::endl;
+    std::cout << "Inference completed in " << duration << "s (";
+    std::cout << (duration > 0.0 ? generated_tokens / duration : 0.0) << " generated tok/s; "
+              << generated_tokens << " tokens)\n";
+
+    return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal inference error: " << e.what() << "\n";
+        return 1;
+    }
+}
