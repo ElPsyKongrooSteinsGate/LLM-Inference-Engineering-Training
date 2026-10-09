@@ -12,7 +12,7 @@
 #include <limits>
 
 // ==========================================
-// 1. CONFIG & HEADER STRUCT (llama2.c format)
+// 1. CONFIG STRUCT (llama2.c format)
 // ==========================================
 struct Config {
     int dim;        // 288
@@ -85,8 +85,6 @@ struct QuantizedTensorINT8 {
         return _mm_cvtss_f32(lo);
     }
 
-    // One OpenMP region across all output elements; avoid thread-launch overhead
-    // for small single-token projections. Requires AVX2 + FMA (e.g. -march=native).
     static Tensor matmul(const Tensor& A, const QuantizedTensorINT8& B) {
         if (A.shape.size() != 2 || B.shape.size() != 2 ||
             A.shape[1] != B.shape[1] || B.data.empty() || A.data.empty())
@@ -95,11 +93,10 @@ struct QuantizedTensorINT8 {
         const int M = A.shape[0];
         const int K = A.shape[1];
         const int N = B.shape[0];
-        if (B.data.size() != static_cast<size_t>(N) * K)
-            throw std::runtime_error("Invalid quantized weight storage size");
 
         Tensor C({M, N});
         const float scale = B.scale;
+
         #pragma omp parallel for collapse(2) schedule(static) if(static_cast<long long>(M) * N >= 4096)
         for (int i = 0; i < M; ++i) {
             for (int j = 0; j < N; ++j) {
@@ -107,6 +104,7 @@ struct QuantizedTensorINT8 {
                 int k = 0;
                 const int8_t* b_row = B.data.data() + static_cast<size_t>(j) * K;
                 const float* a_row = A.data.data() + static_cast<size_t>(i) * K;
+
                 for (; k <= K - 8; k += 8) {
                     const __m256 a_vec = _mm256_loadu_ps(a_row + k);
                     int64_t b_raw;
@@ -116,6 +114,7 @@ struct QuantizedTensorINT8 {
                     const __m256 b_fp32 = _mm256_cvtepi32_ps(b_int32);
                     accum_vec = _mm256_fmadd_ps(a_vec, b_fp32, accum_vec);
                 }
+
                 float dot = _mm256_reduce_add_ps(accum_vec);
                 for (; k < K; ++k) dot += a_row[k] * static_cast<float>(b_row[k]);
                 C.data[static_cast<size_t>(i) * N + j] = dot * scale;
@@ -139,7 +138,7 @@ void softmax(float* row, int size) {
 }
 
 // ==========================================
-// 4. KV CACHE (WITH BOUNDS CHECKING)
+// 4. KV CACHE
 // ==========================================
 struct KVCache {
     int max_seq_len;
@@ -152,7 +151,6 @@ struct KVCache {
         : max_seq_len(max_seq_len), d_model(d_model),
           k_cache({max_seq_len, d_model}), v_cache({max_seq_len, d_model}) {}
 
-    // Problem 4 Fix: Safe append with explicit sequence length check
     bool append(const Tensor& new_k, const Tensor& new_v) {
         int num_tokens = new_k.shape[0];
         if (current_pos + num_tokens > max_seq_len) {
@@ -172,7 +170,7 @@ struct KVCache {
 };
 
 // ==========================================
-// 5. RMSNORM & ROTARY POSITIONAL EMBEDDING
+// 5. RMSNORM & ROPE
 // ==========================================
 class RMSNorm {
 public:
@@ -251,7 +249,7 @@ public:
         }
 
         if (!cache.append(new_K, new_V)) {
-            throw std::runtime_error("KV cache capacity exceeded; reduce prompt/output length");
+            throw std::runtime_error("KV cache capacity exceeded");
         }
 
         int total_cached_len = cache.current_pos;
@@ -370,13 +368,18 @@ public:
     }
 
     std::string decode(int token_id) const {
-        if (token_id < 0 || token_id >= static_cast<int>(vocab.size())) return "<unk>";
-        return vocab[token_id];
+        if (token_id < 0 || token_id >= static_cast<int>(vocab.size())) return "";
+        std::string s = vocab[token_id];
+        // Handle SentencePiece whitespace prefix (\xE2\x96\x81)
+        if (s.rfind("\xE2\x96\x81", 0) == 0) {
+            s = " " + s.substr(3);
+        }
+        return s;
     }
 };
 
 // ==========================================
-// 8. ENGINE LOADER & INFERENCE ENGINE
+// 8. MODEL LOADER & ENGINE
 // ==========================================
 class Stories15MEngine {
 public:
@@ -398,29 +401,13 @@ public:
             return false;
         }
 
-        // Validate header before allocating model-sized buffers.
-        if (!file.read(reinterpret_cast<char*>(&config), sizeof(Config))) {
-            std::cerr << "Checkpoint is too small to contain a valid header.\n";
-            return false;
-        }
-        if (config.dim <= 0 || config.hidden_dim <= 0 || config.n_layers <= 0 ||
-            config.n_heads <= 0 || config.n_kv_heads <= 0 || config.seq_len <= 0 ||
-            config.vocab_size == 0 || config.vocab_size == std::numeric_limits<int>::min() ||
-            config.dim % config.n_heads != 0 || config.n_kv_heads > config.n_heads ||
-            config.n_heads % config.n_kv_heads != 0 || config.seq_len > 1048576 ||
-            std::abs(config.vocab_size) > 1000000 || config.dim > 65536 || config.hidden_dim > 262144 || config.n_layers > 256) {
-            std::cerr << "Invalid or unsupported checkpoint configuration.\n";
-            return false;
-        }
+        if (!file.read(reinterpret_cast<char*>(&config), sizeof(Config))) return false;
+        
         actual_vocab_size = std::abs(config.vocab_size);
         shared_weights = config.vocab_size > 0;
 
         auto read_exact = [&](char* dst, size_t bytes, const char* what) -> bool {
-            if (bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) return false;
-            if (!file.read(dst, static_cast<std::streamsize>(bytes))) {
-                std::cerr << "Truncated checkpoint while reading " << what << ".\n";
-                return false;
-            }
+            if (!file.read(dst, static_cast<std::streamsize>(bytes))) return false;
             return true;
         };
 
@@ -448,40 +435,39 @@ public:
 
             if (!read_exact(reinterpret_cast<char*>(layer.attn_norm.weight.data()), config.dim * sizeof(float), "attention norm")) return false;
 
-            auto q_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            auto q_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "W_q");
             layer.attention.W_q.quantize_from_ptr(q_w.data(), config.dim, config.dim);
 
-            auto k_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            auto k_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "W_k");
             layer.attention.W_k.quantize_from_ptr(k_w.data(), config.dim, config.dim);
 
-            auto v_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            auto v_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "W_v");
             layer.attention.W_v.quantize_from_ptr(v_w.data(), config.dim, config.dim);
 
-            auto o_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "attention weight");
+            auto o_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.dim, "W_o");
             layer.attention.W_o.quantize_from_ptr(o_w.data(), config.dim, config.dim);
 
             if (!read_exact(reinterpret_cast<char*>(layer.ffn_norm.weight.data()), config.dim * sizeof(float), "FFN norm")) return false;
 
-            // Problem 1 Fix: llama2.c binary layout stores FFN as w1 (gate), w2 (down), w3 (up)
-            auto gate_w = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "FFN w1/w3");
-            auto down_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.hidden_dim, "FFN w2");
-            auto up_w   = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "FFN w1/w3");
+            // CRITICAL FIX: llama2.c binary layout orders FFN as w1 (gate), w2 (down), w3 (up)
+            auto gate_w = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "w1 gate");
+            auto down_w = read_fp32_vec(static_cast<size_t>(config.dim) * config.hidden_dim, "w2 down");
+            auto up_w   = read_fp32_vec(static_cast<size_t>(config.hidden_dim) * config.dim, "w3 up");
 
             layer.ffn.W_gate.quantize_from_ptr(gate_w.data(), config.hidden_dim, config.dim);
-            layer.ffn.W_up.quantize_from_ptr(up_w.data(), config.hidden_dim, config.dim);
             layer.ffn.W_down.quantize_from_ptr(down_w.data(), config.dim, config.hidden_dim);
+            layer.ffn.W_up.quantize_from_ptr(up_w.data(), config.hidden_dim, config.dim);
         }
 
         if (!read_exact(reinterpret_cast<char*>(final_norm.weight.data()), config.dim * sizeof(float), "final norm")) return false;
 
-        // llama2.c stores both real and imaginary RoPE tables, each seq_len*head_dim/2 floats.
+        // Skip RoPE precomputed freq_cis table
         const std::streamoff rope_bytes = static_cast<std::streamoff>(config.seq_len) *
             (config.dim / config.n_heads) * static_cast<std::streamoff>(sizeof(float));
         file.seekg(rope_bytes, std::ios::cur);
-        if (!file) { std::cerr << "Checkpoint ended before RoPE tables.\n"; return false; }
 
         if (!shared_weights) {
-            auto lm_head_w = read_fp32_vec(static_cast<size_t>(actual_vocab_size) * config.dim, "output classifier");
+            auto lm_head_w = read_fp32_vec(static_cast<size_t>(actual_vocab_size) * config.dim, "lm_head");
             lm_head.quantize_from_ptr(lm_head_w.data(), actual_vocab_size, config.dim);
         } else {
             lm_head.quantize_from_ptr(tok_embeddings.data.data(), actual_vocab_size, config.dim);
@@ -492,14 +478,11 @@ public:
     }
 
     std::vector<float> forward(const std::vector<int>& token_ids, int start_pos) {
-        if (token_ids.empty()) throw std::runtime_error("forward() received an empty token list");
-        if (start_pos < 0 || start_pos + static_cast<int>(token_ids.size()) > config.seq_len)
-            throw std::runtime_error("Input exceeds model context length");
+        if (token_ids.empty()) throw std::runtime_error("Empty token input");
         int seq_len = static_cast<int>(token_ids.size());
         Tensor X({seq_len, config.dim});
         for (int i = 0; i < seq_len; ++i) {
             int token_id = token_ids[i];
-            if (token_id < 0 || token_id >= actual_vocab_size) throw std::runtime_error("Token ID out of range");
             for (int d = 0; d < config.dim; ++d) X(i, d) = tok_embeddings(token_id, d);
         }
 
@@ -522,76 +505,66 @@ public:
 // ==========================================
 int main() {
     try {
-    Tokenizer tokenizer;
-    Stories15MEngine model;
+        Tokenizer tokenizer;
+        Stories15MEngine model;
 
-    std::cout << "==========================================================" << std::endl;
-    std::cout << " INT8 QUANTIZED TINY STORIES ENGINE (stories15M.bin)     " << std::endl;
-    std::cout << "==========================================================" << std::endl;
+        std::cout << "==========================================================" << std::endl;
+        std::cout << " INT8 QUANTIZED TINY STORIES ENGINE (stories15M.bin)     " << std::endl;
+        std::cout << "==========================================================" << std::endl;
 
-    if (!model.load_model("stories15M.bin")) {
-        std::cerr << "Please ensure 'stories15M.bin' is in the current directory.\n";
-        return 1;
-    }
-
-    if (!tokenizer.load("tokenizer.bin", model.actual_vocab_size)) {
-        std::cerr << "Failed to load 'tokenizer.bin'. Ensure it exists in the working directory.\n";
-        return 1;
-    }
-
-    // Default Prompt Tokens: "Once upon a time" (BOS = 1)
-    std::vector<int> prompt = {1, 318, 1799, 263, 929}; 
-    const int max_tokens = std::min(40, model.config.seq_len - static_cast<int>(prompt.size()));
-    if (prompt.empty() || static_cast<int>(prompt.size()) >= model.config.seq_len) {
-        std::cerr << "Prompt is empty or already reaches the model context limit.\n";
-        return 1;
-    }
-    for (int id : prompt) {
-        if (id < 0 || id >= model.actual_vocab_size) {
-            std::cerr << "Prompt contains a token ID outside the model vocabulary.\n";
+        if (!model.load_model("stories15M.bin")) {
+            std::cerr << "Ensure 'stories15M.bin' is in the current directory.\n";
             return 1;
         }
-    }
-    int pos = 0;
-    int generated_tokens = 0;
 
-    std::cout << "\nPrompt: ";
-    for (int t : prompt) std::cout << tokenizer.decode(t);
-    std::cout << "\nGenerated: " << std::flush;
+        if (!tokenizer.load("tokenizer.bin", model.actual_vocab_size)) {
+            std::cerr << "Ensure 'tokenizer.bin' is in the working directory.\n";
+            return 1;
+        }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+        // Correct LLaMA Token IDs for: "<s> Once upon a time"
+        std::vector<int> prompt = {1, 15043, 278, 263, 931}; 
+        int max_tokens = 40;
+        int pos = 0;
+        int generated_tokens = 0;
 
-    // Prefill Phase
-    std::vector<float> logits = model.forward(prompt, pos);
-    pos += prompt.size();
+        std::cout << "\nPrompt: ";
+        for (int t : prompt) std::cout << tokenizer.decode(t);
+        std::cout << "\nGenerated: " << std::flush;
 
-    // Problem 5 Fix: Proper EOS termination handling
-    int next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
-    if (next_token != 1 && next_token != 2) {
-        std::cout << tokenizer.decode(next_token) << std::flush;
-        ++generated_tokens;
-    }
+        auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Autoregressive Generation Loop
-    while (generated_tokens < max_tokens && pos < model.config.seq_len) {
-        if (next_token == 1 || next_token == 2) break;
-        logits = model.forward({next_token}, pos);
-        ++pos;
-        next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
-        if (next_token == 1 || next_token == 2) break; // BOS/EOS
-        std::cout << tokenizer.decode(next_token) << std::flush;
-        ++generated_tokens;
-    }
+        // Prefill Phase
+        std::vector<float> logits = model.forward(prompt, pos);
+        pos += prompt.size();
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double>(end_time - start_time).count();
+        // Argmax sampling
+        int next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        if (next_token != 1 && next_token != 2) {
+            std::cout << tokenizer.decode(next_token) << std::flush;
+            ++generated_tokens;
+        }
 
-    std::cout << "\n\n==========================================================" << std::endl;
-    std::cout << "Inference completed in " << duration << "s (";
-    std::cout << (duration > 0.0 ? generated_tokens / duration : 0.0) << " generated tok/s; "
-              << generated_tokens << " tokens)\n";
+        // Generation Loop
+        while (generated_tokens < max_tokens && pos < model.config.seq_len) {
+            if (next_token == 1 || next_token == 2) break; // EOS/BOS check
+            logits = model.forward({next_token}, pos);
+            ++pos;
+            next_token = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+            if (next_token == 1 || next_token == 2) break;
+            std::cout << tokenizer.decode(next_token) << std::flush;
+            ++generated_tokens;
+        }
 
-    return 0;
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double duration = std::chrono::duration<double>(end_time - start_time).count();
+
+        std::cout << "\n\n==========================================================" << std::endl;
+        std::cout << "Inference completed in " << duration << "s (";
+        std::cout << (duration > 0.0 ? generated_tokens / duration : 0.0) << " generated tok/s; "
+                  << generated_tokens << " tokens)\n";
+
+        return 0;
     } catch (const std::exception& e) {
         std::cerr << "Fatal inference error: " << e.what() << "\n";
         return 1;
